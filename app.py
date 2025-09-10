@@ -1,7 +1,7 @@
 # ============================================================
 # EDA Chancado — FUSIÓN (Streamlit Cloud + PPTX 16:9)
 # ============================================================
-import io, os, re
+import io, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -118,23 +118,24 @@ uploaded = st.sidebar.file_uploader("📂 Sube tu CSV", type=["csv","txt"])
 sep_semicolon = st.sidebar.checkbox("Separador ';' (alternativo)", value=False)
 
 # ---------- Carga ----------
-df = None
-if uploaded is not None:
-    try:
-        if sep_semicolon:
-            raw = pd.read_csv(uploaded, sep=";")
-        else:
-            raw = pd.read_csv(uploaded)
-        df = load_dataset_v2(raw)
-        st.success(f"✔ Dataset: {len(df):,} filas — {df['Fecha'].min().date()} → {df['Fecha'].max().date()}")
-    except Exception as e:
-        st.error(f"Error al cargar/parsear: {e}")
-
-st.markdown("---")
-
-if df is None:
+if uploaded is None:
     st.info("Sube un CSV para iniciar el análisis.")
     st.stop()
+
+try:
+    raw = pd.read_csv(uploaded, sep=";" if sep_semicolon else ",")
+except Exception:
+    # fallback por si no es coma/; estándar
+    raw = pd.read_csv(uploaded, sep=None, engine="python")
+
+try:
+    df = load_dataset_v2(raw)
+    st.success(f"✔ Dataset: {len(df):,} filas — {df['Fecha'].min().date()} → {df['Fecha'].max().date()}")
+except Exception as e:
+    st.error(f"Error al cargar/parsear: {e}")
+    st.stop()
+
+st.markdown("---")
 
 # ================= KPIs & Percentiles =================
 kpis = {
@@ -292,7 +293,15 @@ fig_iso, ax = plt.subplots(figsize=(10, 6))
 sns.heatmap(pv, annot=True, fmt=".1f", cmap=cmap, cbar_kws={"label": "Δ Tons (%)"}, annot_kws={"fontsize": 11}, ax=ax)
 ax.set_title("Iso-%: %ΔTPH vs %ΔHoras → %ΔTons"); ax.set_xlabel("% Δ Horas"); ax.set_ylabel("% Δ TPH")
 xt = [f"{v*100:.0f}%" for v in pv.columns]; yt = [f"{v*100:.0f}%" for v in pv.index]
-ax.set_xticks(np.arange(len(xt)) + 0.5, xt); ax.set_yticks(np.arange(len(yt)) + 0.5, yt)
+
+# ✅ Parche compatibilidad ticks (dos pasos)
+posx = np.arange(len(xt)) + 0.5
+ax.set_xticks(posx)
+ax.set_xticklabels(xt)
+posy = np.arange(len(yt)) + 0.5
+ax.set_yticks(posy)
+ax.set_yticklabels(yt)
+
 ax.tick_params(axis="x", rotation=0); ax.tick_params(axis="y", rotation=0)
 plt.tight_layout()
 st.pyplot(fig_iso, use_container_width=True)
@@ -319,6 +328,7 @@ ax.set_title("Equiparada: ΔTPH (%) × Δhoras (h/día) → Δ producción (%)")
 ax.set_xlabel("Δ TPH (%)"); ax.set_ylabel("Δ horas (h/día)")
 ax.set_xticklabels(ax.get_xticklabels(), fontsize=11, rotation=0)
 ax.set_yticklabels(ax.get_yticklabels(), fontsize=11, rotation=0)
+
 # línea guía
 xs = np.linspace(pct.min(), pct.max(), 200)
 ys = xs * dh_equiv_1pct / 100.0
@@ -397,7 +407,6 @@ def build_pptx(df, figs, narrative_lines):
 
     add_title_slide("Chancado — Consolidado", f"{df['Fecha'].min().date()} a {df['Fecha'].max().date()}")
 
-    # Agregar todas las figuras
     titles = [
         "Evolución diaria — TPH y Horas",
         "Distribución mensual — TPH y Horas",
@@ -417,7 +426,7 @@ def build_pptx(df, figs, narrative_lines):
     out.seek(0)
     return out
 
-# Regenerar figuras para PPTX (en bytes)
+# Regenerar/empacar figuras para PPTX (en bytes)
 fig1 = fig_serie_temporal(df)
 buf1 = save_current_fig_to_bytes(fig1)
 
@@ -430,7 +439,12 @@ buf3 = save_current_fig_to_bytes(fig3)
 fig4 = fig_brechas(promedios)
 buf4 = save_current_fig_to_bytes(fig4)
 
-# Para ANOVA, generamos tablas como imágenes simples
+fig5 = fig_iso
+buf5 = save_current_fig_to_bytes(fig5)
+
+fig6 = fig_eq
+buf6 = save_current_fig_to_bytes(fig6)
+
 def table_to_fig(table_df, title):
     fig, ax = plt.subplots(figsize=(7.5,3.2))
     ax.axis("off")
@@ -443,12 +457,6 @@ def table_to_fig(table_df, title):
         ax.text(0.5,0.5,f"Error: {e}",ha="center",va="center")
     plt.tight_layout()
     return fig
-
-fig5 = fig_iso
-buf5 = save_current_fig_to_bytes(fig5)
-
-fig6 = fig_eq
-buf6 = save_current_fig_to_bytes(fig6)
 
 fig7 = table_to_fig(anova_tph, "ANOVA — TPH por mes")
 buf7 = save_current_fig_to_bytes(fig7)
