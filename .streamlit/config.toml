@@ -1,8 +1,3 @@
-[theme]
-primaryColor="#328BA1"
-backgroundColor="#FFFFFF"
-secondaryBackgroundColor="#F7F9FB"
-textColor="#0B5563"
 [server]
-fileWatcherType = "poll"   # evita inotify
+fileWatcherType = "poll"   # evita inotify en Cloud
 folderWatchBlacklist = [".git", "venv", ".pythonlibs", ".streamlit"]
