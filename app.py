@@ -1,6 +1,9 @@
 # ============================================================
-# EDA Chancado — FUSIÓN (Streamlit Cloud + PPTX 16:9)
+# EDA Chancado — FUSIÓN (Streamlit Cloud, versión simple y útil)
+# Controles: Periodo, Métrica foco, Brecha Δ/%, Outliers, Sensibilidad,
+#            ANOVA α, Exportar PPT con notas del presentador
 # ============================================================
+
 import io, re
 import numpy as np
 import pandas as pd
@@ -10,26 +13,23 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import StrMethodFormatter
 from matplotlib.dates import DateFormatter, MonthLocator
 from matplotlib import colors as mcolors
+
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd, MultiComparison
+
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
 st.set_page_config(page_title="EDA Chancado — FUSIÓN", layout="wide")
-
-# ---------- Estilo ----------
-PALETTE = ["#328BA1", "#0B5563", "#00AFAA", "#66C7C7", "#BFD8D2", "#003B5C", "#7FB7BE"]
-custom_palette = PALETTE[:5]
 sns.set_theme(style="whitegrid")
 
-def fmt_thousands(x):
-    try:
-        return f"{int(round(x)):,}".replace(",", ".")
-    except Exception:
-        return ""
+# ---------- Paleta ----------
+PALETTE = ["#328BA1", "#0B5563", "#00AFAA", "#66C7C7", "#BFD8D2", "#003B5C", "#7FB7BE"]
+custom_palette = PALETTE[:5]
 
-# ---------- Utilidades de limpieza ----------
+# ---------- Helpers ----------
 def _normalize_colname(c: str) -> str:
     return (c.strip().lower()
             .replace("/", "_")
@@ -95,10 +95,6 @@ def _parse_fecha_mmddyyyy_with_report(s: pd.Series):
         "invalid": int(fechas.isna().sum())
     }
     st.caption(f"🗓️ Validación fechas: {report}")
-    if report["invalid"] > 0:
-        bad = list(fechas[fechas.isna()].index)[:5]
-        for i in bad:
-            st.caption(f"  • inválida: '{raw.iloc[i]}' → NaT")
     return fechas
 
 def load_dataset_v2(df_in: pd.DataFrame) -> pd.DataFrame:
@@ -110,14 +106,64 @@ def load_dataset_v2(df_in: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
     out["mes"] = out["Fecha"].dt.to_period("M").astype(str)
     out["mes_fecha"] = pd.to_datetime(out["Fecha"].dt.to_period("M").astype(str) + "-01", errors="coerce")
+    # Producción diaria observada
+    out["produccion_t"] = out["rendimiento_real_tph"] * out["tiempo_operativo_real_h/dia"]
+    out["produccion_plan_t"] = out["rendimiento_plan_tph"] * out["tiempo_operativo_plan_h/dia"]
     return out
 
-# ---------- Sidebar ----------
-st.sidebar.title("EDA Chancado — FUSIÓN")
-uploaded = st.sidebar.file_uploader("📂 Sube tu CSV", type=["csv","txt"])
-sep_semicolon = st.sidebar.checkbox("Separador ';' (alternativo)", value=False)
+def remove_outliers_iqr(df, cols, factor=1.5):
+    d = df.copy()
+    mask = pd.Series(True, index=d.index)
+    for c in cols:
+        q1, q3 = d[c].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - factor*iqr, q3 + factor*iqr
+        mask &= d[c].between(lo, hi) | d[c].isna()
+    return d[mask].copy()
 
-# ---------- Carga ----------
+def month_order(values):
+    # 'YYYY-MM' -> datetime for sorting
+    return sorted(values, key=lambda x: pd.to_datetime(x+"-01"))
+
+def ci95(mean, std, n):
+    if n <= 1 or pd.isna(std): return 0.0
+    se = std/np.sqrt(n)
+    return 1.96*se
+
+def tukey_letters(data, group_col, value_col, alpha=0.05):
+    # Compact Letter Display from Tukey HSD
+    mc = MultiComparison(data[value_col].values, data[group_col].values)
+    res = mc.tukeyhsd(alpha=alpha)
+    groups = mc.groupsunique
+    # Build adjacency: not significantly different -> connect
+    # res.reject True means different; False means same group
+    n = len(groups)
+    same = {g:set([g]) for g in groups}
+    for i in range(len(res.reject)):
+        a, b = res._multicomp.pairindices[i]
+        ga, gb = groups[a], groups[b]
+        if not res.reject[i]:
+            same[ga].add(gb); same[gb].add(ga)
+    # Greedy letter assignment
+    letters = {g:"" for g in groups}
+    assigned = []
+    for g in groups:
+        placed = False
+        for lset, letter in assigned:
+            # can we put g into this letter group? must be same with all in lset
+            if all((gg in same[g]) for gg in lset):
+                lset.add(g); letters[g]+=letter; placed=True; break
+        if not placed:
+            new_letter = chr(ord('A')+len(assigned))
+            assigned.append((set([g]), new_letter))
+            letters[g]+=new_letter
+    return letters  # dict: group -> letters like 'A', 'AB', ...
+
+# ---------- Sidebar (7 controles esenciales) ----------
+st.sidebar.title("Controles")
+
+uploaded = st.sidebar.file_uploader("📂 Sube tu CSV", type=["csv","txt"])
+sep_semicolon = st.sidebar.checkbox("Separador ';'", value=False)
 if uploaded is None:
     st.info("Sube un CSV para iniciar el análisis.")
     st.stop()
@@ -125,346 +171,340 @@ if uploaded is None:
 try:
     raw = pd.read_csv(uploaded, sep=";" if sep_semicolon else ",")
 except Exception:
-    # fallback por si no es coma/; estándar
     raw = pd.read_csv(uploaded, sep=None, engine="python")
 
-try:
-    df = load_dataset_v2(raw)
-    st.success(f"✔ Dataset: {len(df):,} filas — {df['Fecha'].min().date()} → {df['Fecha'].max().date()}")
-except Exception as e:
-    st.error(f"Error al cargar/parsear: {e}")
-    st.stop()
+df = load_dataset_v2(raw)
 
-st.markdown("---")
+# 1) Periodo (mes inicio–fin)
+meses_all = month_order(df["mes"].dropna().unique())
+mes_ini, mes_fin = st.sidebar.select_slider("Periodo (mes)", options=meses_all, value=(meses_all[0], meses_all[-1]))
+mask_periodo = (df["mes"] >= mes_ini) & (df["mes"] <= mes_fin)
+dfp = df.loc[mask_periodo].copy()
 
-# ================= KPIs & Percentiles =================
-kpis = {
-    "Mineral real (t)": df["mineral_procesado_real_t"].sum(),
-    "Mineral plan (t)": df["mineral_procesado_plan_t"].sum(),
-    "Δ Mineral (t)": df["mineral_procesado_real_t"].sum() - df["mineral_procesado_plan_t"].sum(),
-    "TPH real prom": df["rendimiento_real_tph"].mean(),
-    "TPH plan prom": df["rendimiento_plan_tph"].mean(),
-    "Horas reales prom": df["tiempo_operativo_real_h/dia"].mean(),
-    "Horas plan prom": df["tiempo_operativo_plan_h/dia"].mean(),
-}
-kpi_df = pd.DataFrame({"KPI": list(kpis.keys()), "Valor": list(kpis.values())})
+# 2) Métrica foco
+metrica_foco = st.sidebar.radio("Métrica foco", ["Producción","TPH","Horas"], index=0)
 
+# 3) Brecha vs plan (Δ ó %)
+modo_brecha = st.sidebar.radio("Brecha vs plan", ["Δ absoluto","Δ %"], index=0)
+
+# 4) Outliers simple (IQR 1.5×)
+filtrar_outliers = st.sidebar.checkbox("Quitar outliers (IQR 1.5×)", value=False)
+if filtrar_outliers:
+    dfp = remove_outliers_iqr(
+        dfp,
+        ["rendimiento_real_tph","tiempo_operativo_real_h/dia","produccion_t"],
+        factor=1.5
+    )
+
+# 5) Sensibilidad (rápida)
+delta_tph_max = st.sidebar.slider("ΔTPH máximo (%)", 0, 10, 5)
+delta_h_max = st.sidebar.slider("ΔHoras máximo (h/d)", 0.0, 4.0, 1.0, step=0.5)
+baseline_real = st.sidebar.checkbox("Baseline real (recomendado)", value=True)
+
+# 6) Significancia ANOVA
+alpha = 0.05 if st.sidebar.radio("α (significancia ANOVA)", ["0.05","0.10"], index=0)=="0.05" else 0.10
+
+# 7) Exportación (PPT con notas)
+incluir_notas = st.sidebar.checkbox("Incluir notas del presentador en PPT", value=True)
+
+st.markdown(f"**Periodo aplicado:** {mes_ini} → {mes_fin}  •  Filas: {len(dfp):,}")
+
+# ================= Resumen KPIs & narrativa =================
+def resumen_kpis(d):
+    kpis = {
+        "Mineral real (t)": d["mineral_procesado_real_t"].sum(),
+        "Mineral plan (t)": d["mineral_procesado_plan_t"].sum(),
+        "Producción real (t)": d["produccion_t"].sum(),
+        "Producción plan (t)": d["produccion_plan_t"].sum(),
+        "TPH real prom": d["rendimiento_real_tph"].mean(),
+        "TPH plan prom": d["rendimiento_plan_tph"].mean(),
+        "Horas reales prom": d["tiempo_operativo_real_h/dia"].mean(),
+        "Horas plan prom": d["tiempo_operativo_plan_h/dia"].mean(),
+    }
+    return pd.DataFrame({"KPI": list(kpis.keys()), "Valor": list(kpis.values())})
+
+kpi_df = resumen_kpis(dfp)
 c1, c2 = st.columns([1,1])
 with c1:
-    st.subheader("KPIs")
+    st.subheader("KPIs del periodo")
     st.dataframe(kpi_df.style.format({"Valor":"{:,.2f}"}), use_container_width=True)
 with c2:
-    st.subheader("Percentiles")
-    qs = [0.05,0.25,0.50,0.75,0.95]
-    percentiles_df = pd.DataFrame({
-        "TPH real": df["rendimiento_real_tph"].quantile(qs).values,
-        "Horas reales": df["tiempo_operativo_real_h/dia"].quantile(qs).values
-    }, index=[f"P{int(q*100)}" for q in qs])
-    st.dataframe(percentiles_df.style.format("{:,.2f}"), use_container_width=True)
+    st.subheader("Narrativa técnica (auto)")
+    # Stats base
+    tph_mean = dfp["rendimiento_real_tph"].mean()
+    tph_med  = dfp["rendimiento_real_tph"].median()
+    h_mean   = dfp["tiempo_operativo_real_h/dia"].mean()
+    h_med    = dfp["tiempo_operativo_real_h/dia"].median()
+    # CV mensual
+    cvm = dfp.groupby("mes").agg(
+        cv_tph=("rendimiento_real_tph", lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x)>0 else np.nan),
+        cv_h  =("tiempo_operativo_real_h/dia", lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x)>0 else np.nan),
+    ).reset_index()
+    cv_tph_min, cv_tph_max = np.nanmin(cvm["cv_tph"]), np.nanmax(cvm["cv_tph"])
+    cv_h_max = np.nanmax(cvm["cv_h"])
+    mes_cv_h_alto = cvm.loc[cvm["cv_h"].idxmax(), "mes"] if cvm["cv_h"].notna().any() else "-"
+    # Brechas promedio
+    delta_tph_prom = (dfp["rendimiento_real_tph"] - dfp["rendimiento_plan_tph"]).mean()
+    delta_h_prom   = (dfp["tiempo_operativo_real_h/dia"] - dfp["tiempo_operativo_plan_h/dia"]).mean()
+    # Equivalencia empírica
+    sum_TPH = dfp["rendimiento_real_tph"].sum()
+    sum_TPH_H = (dfp["rendimiento_real_tph"] * dfp["tiempo_operativo_real_h/dia"]).sum()
+    dh_equiv = 0.01 * (sum_TPH_H / max(sum_TPH, 1e-9))
 
+    narrativa = [
+        f"Periodo analizado {mes_ini}–{mes_fin}.",
+        f"TPH real: media {tph_mean:.1f}, mediana {tph_med:.1f}. Horas reales: media {h_mean:.2f} h/d, mediana {h_med:.2f} h/d.",
+        f"Variabilidad mensual: CV(TPH) entre {cv_tph_min:.2f} y {cv_tph_max:.2f}; CV(Horas) máx {cv_h_max:.2f} en {mes_cv_h_alto}.",
+        f"Brechas promedio vs plan — ΔTPH {delta_tph_prom:+.1f}, ΔHoras {delta_h_prom:+.1f} h/d.",
+        f"Equivalencia empírica: 1% TPH ≈ {dh_equiv:.2f} h/d (si <0.6 favorece disponibilidad; si ≥0.6 favorece capacidad instantánea)."
+    ]
+    st.markdown("\n\n".join(["- " + s for s in narrativa]))
+
+# ================= Comparación vs plan (mensual) + Brecha mensual =================
 st.markdown("---")
+st.subheader("Comparación mensual vs plan")
 
-# ================= 1) Serie temporal =================
-def fig_serie_temporal(d):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharex=False)
-    # TPH
-    sns.lineplot(data=d, x="Fecha", y="rendimiento_real_tph", ax=axes[0],
-                 color=custom_palette[0], label="TPH real")
-    axes[0].axhline(d["rendimiento_plan_tph"].median(), color="grey", linestyle="--", label="Plan (mediana)")
-    axes[0].set_title("Evolución diaria TPH")
-    axes[0].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[0].legend(loc="upper left"); axes[0].grid(True, alpha=0.25)
-
-    # Horas
-    sns.lineplot(data=d, x="Fecha", y="tiempo_operativo_real_h/dia", ax=axes[1],
-                 color=custom_palette[2], label="Horas reales")
-    axes[1].axhline(d["tiempo_operativo_plan_h/dia"].median(), color="grey", linestyle="--", label="Plan (mediana)")
-    axes[1].set_title("Evolución diaria Horas")
-    axes[1].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[1].legend(loc="upper left"); axes[1].grid(True, alpha=0.25)
-
-    for ax in axes:
-        ax.xaxis.set_major_locator(MonthLocator(interval=1))
-        ax.xaxis.set_major_formatter(DateFormatter("%b-%y"))
-        for label in ax.get_xticklabels():
-            label.set_rotation(0)
-    plt.tight_layout()
-    return fig
-
-st.subheader("Serie temporal — TPH y Horas")
-st.pyplot(fig_serie_temporal(df), use_container_width=True)
-
-# ================= 2) Boxplots mensuales =================
-def fig_boxplots(d):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5), sharex=True)
-    sns.boxplot(data=d, x="mes", y="rendimiento_real_tph", ax=axes[0], palette=custom_palette)
-    axes[0].set_title("Distribución mensual TPH")
-    axes[0].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[0].tick_params(axis="x", rotation=45)
-    sns.boxplot(data=d, x="mes", y="tiempo_operativo_real_h/dia", ax=axes[1], palette=custom_palette)
-    axes[1].set_title("Distribución mensual Horas")
-    axes[1].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[1].tick_params(axis="x", rotation=45)
-    plt.tight_layout()
-    return fig
-
-st.subheader("Distribución mensual — TPH y Horas")
-st.pyplot(fig_boxplots(df), use_container_width=True)
-
-# ================= 3) CV mensual =================
-cv = df.groupby("mes", as_index=False).agg({
-    "rendimiento_real_tph": lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x) > 0 else np.nan,
-    "tiempo_operativo_real_h/dia": lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x) > 0 else np.nan
+agg_fun = "mean"  # simple y robusto; podrías exponerlo como control
+gm = dfp.groupby("mes", as_index=False).agg({
+    "rendimiento_real_tph": agg_fun,
+    "rendimiento_plan_tph": agg_fun,
+    "tiempo_operativo_real_h/dia": agg_fun,
+    "tiempo_operativo_plan_h/dia": agg_fun,
+    "produccion_t": agg_fun,
+    "produccion_plan_t": agg_fun
 })
-def fig_cv(cv):
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-    sns.lineplot(data=cv, x="mes", y="rendimiento_real_tph", marker="o", ax=ax,
-                 label="CV TPH", color=custom_palette[0])
-    sns.lineplot(data=cv, x="mes", y="tiempo_operativo_real_h/dia", marker="o", ax=ax,
-                 label="CV Horas", color=custom_palette[2])
-    ax.set_title("Coeficiente de variación mensual")
-    ax.legend(loc="upper left")
-    plt.xticks(rotation=45)
+gm = gm.sort_values("mes")
+
+def plot_grouped_bars(dfm, y_real, y_plan, title):
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    x = np.arange(len(dfm))
+    w = 0.38
+    ax.bar(x-w/2, dfm[y_real], width=w, label="Real", color=custom_palette[0])
+    ax.bar(x+w/2, dfm[y_plan], width=w, label="Plan", color=custom_palette[2])
+    ax.set_xticks(x)
+    ax.set_xticklabels(dfm["mes"], rotation=45, ha="right")
+    ax.set_title(title); ax.legend()
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     return fig
 
-st.subheader("Variabilidad (CV)")
-st.pyplot(fig_cv(cv), use_container_width=True)
-
-# ================= 4) Brechas promedio vs plan =================
-df["delta_tph"] = df["rendimiento_real_tph"] - df["rendimiento_plan_tph"]
-df["delta_horas"] = df["tiempo_operativo_real_h/dia"] - df["tiempo_operativo_plan_h/dia"]
-promedios = df[["delta_tph", "delta_horas"]].mean()
-
-def fig_brechas(promedios):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-    sns.barplot(x=["Δ TPH"], y=[promedios["delta_tph"]], ax=axes[0], color=custom_palette[0])
-    axes[0].set_title("Brecha promedio TPH vs Plan")
-    axes[0].bar_label(axes[0].containers[0], fmt="%.0f", label_type="center", color="white")
-    axes[0].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[0].grid(axis="y", alpha=0.25)
-
-    sns.barplot(x=["Δ Horas"], y=[promedios["delta_horas"]], ax=axes[1], color=custom_palette[2])
-    axes[1].set_title("Brecha promedio Horas vs Plan")
-    axes[1].bar_label(axes[1].containers[0], fmt="%.0f", label_type="center", color="white")
-    axes[1].yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
-    axes[1].grid(axis="y", alpha=0.25)
-    plt.tight_layout()
+def plot_brecha_mensual(dfm, y_real, y_plan, title, modo="Δ absoluto"):
+    d = dfm.copy()
+    if modo == "Δ absoluto":
+        d["brecha"] = d[y_real] - d[y_plan]
+        label_fmt = lambda v: f"{v:+.1f}"
+        yfmt = StrMethodFormatter("{x:,.1f}")
+    else:
+        base = d[y_plan].replace(0, np.nan)
+        d["brecha"] = (d[y_real] - d[y_plan]) / base * 100.0
+        label_fmt = lambda v: f"{v:+.1f}%"
+        yfmt = StrMethodFormatter("{x:,.0f}%")
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    colors = [custom_palette[0] if v>=0 else "#C64756" for v in d["brecha"]]
+    ax.bar(d["mes"], d["brecha"], color=colors)
+    ax.set_title(title)
+    ax.yaxis.set_major_formatter(yfmt)
+    ax.grid(axis="y", alpha=0.25)
+    # etiquetas
+    for i, v in enumerate(d["brecha"]):
+        ax.text(i, v + (0.02*np.nanmax(np.abs(d["brecha"])) if v>=0 else -0.02*np.nanmax(np.abs(d["brecha"]))),
+                label_fmt(v), ha="center", va="bottom" if v>=0 else "top", fontsize=9)
+    plt.xticks(rotation=45, ha="right"); plt.tight_layout()
     return fig
 
-st.subheader("Brechas promedio vs plan")
-st.pyplot(fig_brechas(promedios), use_container_width=True)
+# Elegir métrica foco para el primer bloque
+if metrica_foco == "TPH":
+    st.pyplot(plot_grouped_bars(gm, "rendimiento_real_tph", "rendimiento_plan_tph", "TPH — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "rendimiento_real_tph", "rendimiento_plan_tph", "Brecha mensual TPH (Real–Plan)", modo_brecha), use_container_width=True)
+elif metrica_foco == "Horas":
+    st.pyplot(plot_grouped_bars(gm, "tiempo_operativo_real_h/dia", "tiempo_operativo_plan_h/dia", "Horas/día — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "tiempo_operativo_real_h/dia", "tiempo_operativo_plan_h/dia", "Brecha mensual Horas (Real–Plan)", modo_brecha), use_container_width=True)
+else:
+    st.pyplot(plot_grouped_bars(gm, "produccion_t", "produccion_plan_t", "Producción (t) — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "produccion_t", "produccion_plan_t", "Brecha mensual Producción (Real–Plan)", modo_brecha), use_container_width=True)
 
-# ================= 5) ANOVA por mes =================
-st.subheader("ANOVA por mes")
-model_tph = ols("rendimiento_real_tph ~ C(mes)", data=df).fit()
-anova_tph = sm.stats.anova_lm(model_tph, typ=2)
-model_h = ols("Q('tiempo_operativo_real_h/dia') ~ C(mes)", data=df).fit()
-anova_h = sm.stats.anova_lm(model_h, typ=2)
+# ================= ANOVA visual (mes) =================
+st.markdown("---")
+st.subheader("ANOVA visual por mes")
+
+def anova_visual(d, col, ylabel):
+    # tabla ANOVA
+    model = ols(f"Q('{col}') ~ C(mes)", data=d).fit()
+    anova_tbl = sm.stats.anova_lm(model, typ=2).round(4)
+
+    # medias, IC95 y letras Tukey
+    stats = d.groupby("mes").agg(mean=(col,"mean"), std=(col,"std"), n=(col,"count")).reset_index()
+    stats["ci"] = stats.apply(lambda r: ci95(r["mean"], r["std"], r["n"]), axis=1)
+
+    # Tukey (solo si al menos 2 niveles)
+    letters_map = {}
+    try:
+        letters_map = tukey_letters(d[["mes",col]].dropna(), "mes", col, alpha=alpha)
+    except Exception:
+        letters_map = {m:"" for m in stats["mes"]}
+
+    stats = stats.sort_values("mes")
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    x = np.arange(len(stats))
+    ax.errorbar(x, stats["mean"], yerr=stats["ci"], fmt="o-", capsize=4, label="Media ± IC95%", color=custom_palette[0])
+    ax.set_xticks(x); ax.set_xticklabels(stats["mes"], rotation=45, ha="right")
+    ax.set_title(f"{ylabel}: Medias mensuales con IC95% (α={alpha})")
+    ax.grid(True, alpha=0.25)
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.1f}"))
+    # letras sobre puntos
+    for i, row in stats.iterrows():
+        ax.text(i, row["mean"] + (0.02*np.nanmax(stats["mean"]) if np.nanmax(stats["mean"])>0 else 0.5),
+                letters_map.get(row["mes"], ""), ha="center", va="bottom", fontsize=10, color="#003B5C")
+    plt.tight_layout()
+    return fig, anova_tbl
+
+# Mostrar dos: TPH y Horas (si foco es Producción igual mostramos ambos para ANOVA)
 c1, c2 = st.columns(2)
 with c1:
-    st.markdown("**TPH**")
-    st.dataframe(anova_tph.round(4), use_container_width=True)
+    fig_tph, anova_tph = anova_visual(dfp, "rendimiento_real_tph", "TPH")
+    st.pyplot(fig_tph, use_container_width=True)
+    st.dataframe(anova_tph, use_container_width=True)
 with c2:
-    st.markdown("**Horas/día**")
-    st.dataframe(anova_h.round(4), use_container_width=True)
+    fig_h, anova_h = anova_visual(dfp, "tiempo_operativo_real_h/dia", "Horas/día")
+    st.pyplot(fig_h, use_container_width=True)
+    st.dataframe(anova_h, use_container_width=True)
 
-# ================= 6) Sensibilidad =================
-st.subheader("Sensibilidad")
+# ================= Sensibilidad (iso-%) — baseline real para evitar negativos falsos =================
+st.markdown("---")
+st.subheader("Sensibilidad (iso-%)")
 
-# 6a) Iso-%
-mean_tph = float(df["rendimiento_real_tph"].mean())
-mean_h   = float(df["tiempo_operativo_real_h/dia"].mean())
-baseline_iso = mean_tph * mean_h if (mean_tph > 0 and mean_h > 0) else np.nan
+mean_tph = float(dfp["rendimiento_real_tph"].mean())
+mean_h   = float(dfp["tiempo_operativo_real_h/dia"].mean())
 
-delta_pct = np.array([0.01, 0.02, 0.03, 0.05, 0.07, 0.10])  # 1%..10%
-grid = []
-for dH in delta_pct:
-    for dT in delta_pct:
-        h_new   = min(mean_h * (1 + dH), 24.0)
+if baseline_real:
+    # producción media diaria observada
+    baseline_iso = float((dfp["produccion_t"].mean()))
+else:
+    baseline_iso = mean_tph * mean_h
+
+# Construimos malla simple: 0..Δmax con paso 1% y 0.5h
+tph_grid = np.arange(0, delta_tph_max+0.001, 1) / 100.0
+h_grid = np.arange(0.0, delta_h_max+1e-9, 0.5)
+
+cells = []
+for dH in h_grid:
+    for dT in tph_grid:
+        h_new   = mean_h * (1 + 0) + dH   # sumamos horas absolutas
         tph_new = mean_tph * (1 + dT)
-        tons_new = h_new * tph_new
-        grid.append({"delta_horas_pct": dH, "delta_tph_pct": dT,
-                     "tons_pct": ((tons_new / baseline_iso - 1.0) * 100) if baseline_iso and baseline_iso > 0 else np.nan})
-grid = pd.DataFrame(grid)
-pv = grid.pivot(index="delta_tph_pct", columns="delta_horas_pct", values="tons_pct")
+        tons_new = tph_new * h_new
+        val = ((tons_new / max(baseline_iso, 1e-9)) - 1.0) * 100.0
+        cells.append({"delta_h_abs": dH, "delta_tph_pct": dT, "tons_pct": val})
+grid = pd.DataFrame(cells)
+pv = grid.pivot(index="delta_tph_pct", columns="delta_h_abs", values="tons_pct")
+
 cmap = mcolors.LinearSegmentedColormap.from_list("afines_heat", ["#E0F7FA", "#00AFAA", "#0B5563"])
-fig_iso, ax = plt.subplots(figsize=(10, 6))
-sns.heatmap(pv, annot=True, fmt=".1f", cmap=cmap, cbar_kws={"label": "Δ Tons (%)"}, annot_kws={"fontsize": 11}, ax=ax)
-ax.set_title("Iso-%: %ΔTPH vs %ΔHoras → %ΔTons"); ax.set_xlabel("% Δ Horas"); ax.set_ylabel("% Δ TPH")
-xt = [f"{v*100:.0f}%" for v in pv.columns]; yt = [f"{v*100:.0f}%" for v in pv.index]
+fig_iso, ax = plt.subplots(figsize=(10,6))
+sns.heatmap(pv, annot=True, fmt=".1f", cmap=cmap, cbar_kws={"label": "Δ Producción (%)"},
+            annot_kws={"fontsize": 10}, ax=ax)
+ax.set_title("Iso-%: impacto de ΔTPH (%) y ΔHoras (h/d) sobre producción (%)")
+ax.set_xlabel("Δ Horas (h/d)"); ax.set_ylabel("Δ TPH (%)")
 
-# ✅ Parche compatibilidad ticks (dos pasos)
+xt = [f"{v:+.1f}h" for v in pv.columns]
+yt = [f"{v*100:.0f}%" for v in pv.index]
+# Ticks compat
 posx = np.arange(len(xt)) + 0.5
-ax.set_xticks(posx)
-ax.set_xticklabels(xt)
+ax.set_xticks(posx); ax.set_xticklabels(xt)
 posy = np.arange(len(yt)) + 0.5
-ax.set_yticks(posy)
-ax.set_yticklabels(yt)
-
+ax.set_yticks(posy); ax.set_yticklabels(yt)
 ax.tick_params(axis="x", rotation=0); ax.tick_params(axis="y", rotation=0)
 plt.tight_layout()
 st.pyplot(fig_iso, use_container_width=True)
 
-# 6b) Equiparada
-pct = np.arange(-10, 21, 2)     # -10% .. +20%
-dh  = np.arange(-2.0, 4.0+1e-9, 0.5)  # -2h .. +4h
-sum_TPH = df["rendimiento_real_tph"].sum()
-sum_TPH_H = (df["rendimiento_real_tph"] * df["tiempo_operativo_real_h/dia"]).sum()
-dh_equiv_1pct = 0.01 * (sum_TPH_H / max(sum_TPH, 1e-9))
-base_series = (df["rendimiento_real_tph"] * df["tiempo_operativo_real_h/dia"]).sum()
-gain = np.zeros((len(dh), len(pct)))
-for i, d in enumerate(dh):
-    for j, p in enumerate(pct):
-        out = ((df["rendimiento_real_tph"]*(1+p/100.0)) * (df["tiempo_operativo_real_h/dia"]+d)).sum()
-        gain[i,j] = (out - base_series) / base_series * 100.0
+# ================= PPT con notas del presentador =================
+st.markdown("---")
+st.subheader("Exportar")
 
-fig_eq, ax = plt.subplots(figsize=(10,6))
-sns.heatmap(gain, cmap="crest",
-            xticklabels=[f"{x:.0f}%" for x in pct],
-            yticklabels=[f"{y:+.1f}h" for y in dh],
-            cbar_kws={"label": "Δ producción (%)"}, ax=ax)
-ax.set_title("Equiparada: ΔTPH (%) × Δhoras (h/día) → Δ producción (%)")
-ax.set_xlabel("Δ TPH (%)"); ax.set_ylabel("Δ horas (h/día)")
-ax.set_xticklabels(ax.get_xticklabels(), fontsize=11, rotation=0)
-ax.set_yticklabels(ax.get_yticklabels(), fontsize=11, rotation=0)
-
-# línea guía
-xs = np.linspace(pct.min(), pct.max(), 200)
-ys = xs * dh_equiv_1pct / 100.0
-for x, y in zip(xs, ys):
-    if y < dh.min() or y > dh.max(): continue
-    j = (np.abs(pct - x)).argmin(); i = (np.abs(dh - y)).argmin()
-    ax.scatter([j+0.5], [i+0.5], s=6, color="#0B5563", marker="s")
-ax.text(0.02, 1.04, f"Equivalencia: 1% TPH ≈ {dh_equiv_1pct:.2f} h/día",
-        transform=ax.transAxes, ha="left", va="bottom", fontsize=10, color="#0B5563")
-plt.tight_layout()
-st.pyplot(fig_eq, use_container_width=True)
-
-st.caption(f"≡ Equivalencia de esfuerzos: 1% TPH ≈ {dh_equiv_1pct:.2f} h/día")
-
-# ================= 7) Narrativa ejecutiva =================
-delta_tph_pct = (df["rendimiento_real_tph"].mean() - df["rendimiento_plan_tph"].mean()) / max(df["rendimiento_plan_tph"].mean(),1e-9) * 100
-delta_h_pct   = (df["tiempo_operativo_real_h/dia"].mean() - df["tiempo_operativo_plan_h/dia"].mean()) / max(df["tiempo_operativo_plan_h/dia"].mean(),1e-9) * 100
-p_tph = anova_tph["PR(>F)"].min() if "PR(>F)" in anova_tph.columns else np.nan
-p_h   = anova_h["PR(>F)"].min() if "PR(>F)" in anova_h.columns else np.nan
-
-st.subheader("Narrativa ejecutiva")
-lines = []
-lines.append(f"1) Promedios vs plan: TPH {delta_tph_pct:+.1f}% | Horas {delta_h_pct:+.1f}%.")
-lines.append("2) La variabilidad mensual (CV) muestra meses inestables; estabilizar operación reduce pérdidas.")
-if not np.isnan(p_tph):
-    lines.append(f"3) ANOVA TPH por mes: p={p_tph:.4f} → diferencias {'significativas' if p_tph<0.05 else 'no significativas'}.")
-if not np.isnan(p_h):
-    lines.append(f"4) ANOVA Horas por mes: p={p_h:.4f} → diferencias {'significativas' if p_h<0.05 else 'no significativas'}.")
-lines.append("5) Sensibilidad: aumentar TPH o horas eleva producción; el mapa equiparado indica qué palanca rinde más según la equivalencia empírica.")
-if dh_equiv_1pct < 0.6:
-    lines.append("6) Quick win: recuperar +0.5h/día suele superar +1% TPH → foco en disponibilidad.")
-else:
-    lines.append("6) Quick win: +1% TPH comparable/superior a +0.5h/día → foco en capacidad instantánea.")
-st.code("\n".join(lines), language="markdown")
-
-# ============================================================
-# DESCARGA PPTX 16:9
-# ============================================================
-def save_current_fig_to_bytes(fig):
+def save_fig_bytes(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-    buf.seek(0)
-    return buf
+    buf.seek(0); return buf
 
-def build_pptx(df, figs, narrative_lines):
+def table_fig(df_table, title):
+    fig, ax = plt.subplots(figsize=(7.5,3.0))
+    ax.axis("off")
+    tb = df_table.copy()
+    if "sum_sq" in tb.columns:
+        tb = tb.round({"sum_sq":4, "df":2, "F":3, "PR(>F)":4})
+    tb = tb.reset_index()
+    tbl = ax.table(cellText=tb.values, colLabels=tb.columns.tolist(), loc="center")
+    tbl.scale(1,1.1)
+    ax.set_title(title, pad=6)
+    plt.tight_layout()
+    return fig
+
+def build_ppt(df_periodo, figs, notes_by_slide, titulo_portada, incluir_notas=True):
     prs = Presentation()
     prs.slide_width  = Inches(13.33)
     prs.slide_height = Inches(7.5)
 
-    def add_title_slide(title, subtitle=""):
-        slide = prs.slides.add_slide(prs.slide_layouts[5])
-        tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12.3), Inches(1.0))
-        p = tx.text_frame.paragraphs[0]
-        p.text = title; p.font.size = Pt(36); p.font.bold = True
-        p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
-        if subtitle:
-            tx2 = slide.shapes.add_textbox(Inches(0.5), Inches(1.3), Inches(12.3), Inches(0.8))
-            p2 = tx2.text_frame.paragraphs[0]
-            p2.text = subtitle; p2.font.size = Pt(18); p2.font.color.rgb = RGBColor(0x0B,0x55,0x63)
-
-    def add_image(title, img_bytes):
+    def add_image_slide(title, img_bytes, notes_text=""):
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12.3), Inches(0.8))
         p = tx.text_frame.paragraphs[0]
         p.text = title; p.font.size = Pt(28); p.font.bold = True; p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
         slide.shapes.add_picture(img_bytes, Inches(0.5), Inches(1.1), width=Inches(12.3))
+        if incluir_notas:
+            notes = slide.notes_slide.notes_text_frame
+            notes.text = notes_text
 
-    def add_bullets(title, lines):
-        slide = prs.slides.add_slide(prs.slide_layouts[5])
-        tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(12.3), Inches(6.5))
-        tf = tx.text_frame; tf.word_wrap = True
-        p = tf.paragraphs[0]; p.text = title
-        p.font.size = Pt(28); p.font.bold = True; p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
-        for line in lines:
-            pr = tf.add_paragraph(); pr.text = line; pr.level = 1; pr.font.size = Pt(20)
+    # portada
+    slide0 = prs.slides.add_slide(prs.slide_layouts[5])
+    tx = slide0.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(12.3), Inches(1.5))
+    p = tx.text_frame.paragraphs[0]
+    p.text = titulo_portada; p.font.size = Pt(36); p.font.bold = True
+    p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
+    if incluir_notas:
+        slide0.notes_slide.notes_text_frame.text = f"Periodo: {mes_ini}–{mes_fin}. Filas: {len(df_periodo):,}."
 
-    add_title_slide("Chancado — Consolidado", f"{df['Fecha'].min().date()} a {df['Fecha'].max().date()}")
+    # slides
+    for (title, figbytes, notes) in figs:
+        add_image_slide(title, figbytes, notes)
 
-    titles = [
-        "Evolución diaria — TPH y Horas",
-        "Distribución mensual — TPH y Horas",
-        "Variabilidad mensual (CV)",
-        "Brechas promedio vs plan",
-        "Sensibilidad iso-%",
-        "Sensibilidad equiparada",
-        "ANOVA — TPH por mes",
-        "ANOVA — Horas por mes"
-    ]
-    for title, fig in zip(titles, figs):
-        add_image(title, fig)
-
-    add_bullets("Narrativa ejecutiva", narrative_lines)
     out = io.BytesIO()
-    prs.save(out)
-    out.seek(0)
+    prs.save(out); out.seek(0)
     return out
 
-# Regenerar/empacar figuras para PPTX (en bytes)
-fig1 = fig_serie_temporal(df)
-buf1 = save_current_fig_to_bytes(fig1)
+# Ensamblar figuras clave
+figs_export = []
 
-fig2 = fig_boxplots(df)
-buf2 = save_current_fig_to_bytes(fig2)
+# 1) Comparación mensual y brecha (según métrica foco)
+if metrica_foco == "TPH":
+    f1 = plot_grouped_bars(gm, "rendimiento_real_tph","rendimiento_plan_tph","TPH — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "rendimiento_real_tph","rendimiento_plan_tph","Brecha mensual TPH (Real–Plan)", modo_brecha)
+elif metrica_foco == "Horas":
+    f1 = plot_grouped_bars(gm, "tiempo_operativo_real_h/dia","tiempo_operativo_plan_h/dia","Horas/día — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "tiempo_operativo_real_h/dia","tiempo_operativo_plan_h/dia","Brecha mensual Horas (Real–Plan)", modo_brecha)
+else:
+    f1 = plot_grouped_bars(gm, "produccion_t","produccion_plan_t","Producción (t) — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "produccion_t","produccion_plan_t","Brecha mensual Producción (Real–Plan)", modo_brecha)
 
-fig3 = fig_cv(cv)
-buf3 = save_current_fig_to_bytes(fig3)
+figs_export.append(("Comparación mensual vs plan", save_fig_bytes(f1),
+                    "Comparación por mes, medias. Revisar meses con sobre/subcumplimiento para ajustar plan."))
+figs_export.append(("Brecha mensual vs plan", save_fig_bytes(f2),
+                    "Brechas en Δ ó %. Identificar top/bottom 3 meses y causas operativas."))
 
-fig4 = fig_brechas(promedios)
-buf4 = save_current_fig_to_bytes(fig4)
+# 2) ANOVA visual + tablas
+figs_export.append(("ANOVA visual — TPH", save_fig_bytes(fig_tph),
+                    "Medias mensuales TPH con IC95%. Letras Tukey indican grupos no diferentes."))
+figs_export.append(("ANOVA visual — Horas", save_fig_bytes(fig_h),
+                    "Medias mensuales Horas con IC95%. Interpretar meses ‘altos/bajos’."))
+figs_export.append(("ANOVA — tabla TPH", save_fig_bytes(table_fig(anova_tph, "ANOVA — TPH")),
+                    "Si p<α hay efecto mes; considerar replanificación en meses críticos."))
+figs_export.append(("ANOVA — tabla Horas", save_fig_bytes(table_fig(anova_h, "ANOVA — Horas")),
+                    "Tamaño de efecto: usar η² (opcional) para priorizar."))
 
-fig5 = fig_iso
-buf5 = save_current_fig_to_bytes(fig5)
+# 3) Sensibilidad iso-%
+figs_export.append(("Sensibilidad iso-%", save_fig_bytes(fig_iso),
+                    "Mapa con baseline real. Aumentos en TPH/horas deben mostrar Δ producción positivo."))
 
-fig6 = fig_eq
-buf6 = save_current_fig_to_bytes(fig6)
-
-def table_to_fig(table_df, title):
-    fig, ax = plt.subplots(figsize=(7.5,3.2))
-    ax.axis("off")
-    try:
-        tb = table_df.copy().round(4).reset_index()
-        tbl = ax.table(cellText=tb.values, colLabels=tb.columns.tolist(), loc="center")
-        tbl.scale(1,1.2)
-        ax.set_title(title, pad=6)
-    except Exception as e:
-        ax.text(0.5,0.5,f"Error: {e}",ha="center",va="center")
-    plt.tight_layout()
-    return fig
-
-fig7 = table_to_fig(anova_tph, "ANOVA — TPH por mes")
-buf7 = save_current_fig_to_bytes(fig7)
-
-fig8 = table_to_fig(anova_h, "ANOVA — Horas por mes")
-buf8 = save_current_fig_to_bytes(fig8)
-
-ppt_bytes = build_pptx(df, [buf1,buf2,buf3,buf4,buf5,buf6,buf7,buf8], lines)
+titulo = f"Chancado — Consolidado ({mes_ini} a {mes_fin})"
+ppt_bytes = build_ppt(dfp, figs_export, None, titulo, incluir_notas=incluir_notas)
 
 st.download_button(
     "⬇️ Descargar PPTX 16:9",
@@ -472,3 +512,4 @@ st.download_button(
     file_name=f"chancado_fusion_{pd.Timestamp.now():%Y%m%d_%H%M}.pptx",
     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
+
